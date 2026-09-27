@@ -341,6 +341,27 @@ def send_telegram(text: str) -> None:
         log.warning("Telegram send failed: %s", e)
 
 
+def send_email(subject: str, text: str) -> None:
+    """Gmail via SMTP with an App Password (needs 2-Step Verification on the Google account)."""
+    user, pwd = os.getenv("EMAIL_USER"), os.getenv("EMAIL_APP_PASSWORD")
+    to = os.getenv("EMAIL_TO") or user
+    if not user or not pwd:
+        log.info("Email not configured - skipping email.")
+        return
+    import smtplib
+    from email.message import EmailMessage
+    msg = EmailMessage()
+    msg["Subject"], msg["From"], msg["To"] = subject, user, to
+    msg.set_content(text)
+    try:
+        with smtplib.SMTP_SSL("smtp.gmail.com", 465, timeout=30) as smtp:
+            smtp.login(user, pwd.replace(" ", ""))
+            smtp.send_message(msg)
+        log.info("Email sent to %s", to)
+    except Exception as e:
+        log.warning("Email send failed: %s", e)
+
+
 def format_report(run_date, data_date, stats, picks, record, note=""):
     lines = [f"NSE Swing Screener - {run_date:%d %b %Y}",
              f"Data as of: {data_date:%d %b %Y}"]
@@ -384,7 +405,9 @@ def main():
     open_tickers = log_df.loc[log_df["status"].isin(["PENDING", "OPEN"]), "ticker"].tolist()
     prices = get_prices(sorted(set(universe) | set(open_tickers)))
     if not prices:
-        send_telegram("Screener: no price data received. Check yfinance / network.")
+        err = "Screener: no price data received. Check yfinance / network."
+        send_telegram(err)
+        send_email("Swing Screener: data error", err)
         sys.exit(1)
 
     run_date = datetime.now(IST).date()
@@ -432,6 +455,14 @@ def main():
     (REPORTS / f"{run_date.isoformat()}.txt").write_text(report, encoding="utf-8")
     print(report)
     send_telegram(report)
+    if picks:
+        subject = f"Swing picks {run_date:%d %b}: " + ", ".join(
+            p["ticker"].replace(".NS", "") for p in picks)
+    elif note:
+        subject = f"Swing Screener {run_date:%d %b}: no run (data not updated)"
+    else:
+        subject = f"Swing Screener {run_date:%d %b}: no setup today"
+    send_email(subject, report)
 
 
 if __name__ == "__main__":

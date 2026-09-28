@@ -2,7 +2,7 @@ name: Daily swing screener
 
 on:
   schedule:
-    - cron: "30 12 * * 1-5"   # 12:30 UTC = 18:00 IST, Mon-Fri
+        - cron: "47 12 * * 1-5"   # 12:47 UTC = 18:17 IST, Mon-Fri
   workflow_dispatch:           # "Run workflow" button for manual runs
 
 permissions:

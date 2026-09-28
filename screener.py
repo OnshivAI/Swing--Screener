@@ -48,6 +48,7 @@ CONFIG = {
     "max_trailing_pe": 60,
     "skip_de_for_sectors": ["Financial Services"],  # D/E not meaningful for banks/NBFCs
     "allow_missing_fundamentals": False,
+    "require_debt_to_equity": False,  # Yahoo often omits D/E (e.g. for low/no-debt firms)
 
     # Momentum gate
     "ema_fast": 20,
@@ -235,10 +236,13 @@ def passes_fundamentals(row: pd.Series):
                        val("returnOnEquity"), val("trailingPE"))
     skip_de = sector in CONFIG["skip_de_for_sectors"]
 
-    required = [pm, roe] + ([] if skip_de else [de])
-    if any(x is None for x in required):
-        return CONFIG["allow_missing_fundamentals"], "missing fields"
-    if not skip_de and float(de) > CONFIG["max_debt_to_equity"]:
+    required = {"profitMargins": pm, "returnOnEquity": roe}
+    if CONFIG["require_debt_to_equity"] and not skip_de:
+        required["debtToEquity"] = de
+    missing = [k for k, x in required.items() if x is None]
+    if missing:
+        return CONFIG["allow_missing_fundamentals"], "missing " + ", ".join(missing)
+    if not skip_de and de is not None and float(de) > CONFIG["max_debt_to_equity"]:
         return False, "high D/E"
     if float(pm) < CONFIG["min_profit_margin"]:
         return False, "low margin"
@@ -246,6 +250,8 @@ def passes_fundamentals(row: pd.Series):
         return False, "low ROE"
     if pe is not None and (float(pe) <= 0 or float(pe) > CONFIG["max_trailing_pe"]):
         return False, "P/E out of range"
+    if de is None and not skip_de:
+        return True, "ok (D/E not reported)"
     return True, "ok"
 
 
@@ -370,6 +376,8 @@ def format_report(run_date, data_date, stats, picks, record, note=""):
     if stats:
         lines.append(f"Scanned {stats['scanned']} | momentum pass {stats['momentum']} | "
                      f"fundamental pass {stats['fundamental']} | risk-ok {stats['tradeable']}")
+        if stats.get("rejected"):
+            lines.append("Momentum ok but failed fundamentals: " + "; ".join(stats["rejected"]))
     lines.append("")
     if picks:
         net = CONFIG["target_pct"] - CONFIG["round_trip_cost_pct"]
@@ -423,13 +431,15 @@ def main():
         mom = {t: s for t in universe if t in prices and (s := momentum_signal(prices[t]))}
         # 2) fundamentals only for survivors
         fund = get_fundamentals(list(mom)) if mom else pd.DataFrame()
-        passed = {}
+        passed, rejected = {}, []
         for t, s in mom.items():
             row = fund.loc[t] if len(fund) and t in fund.index else None
             ok, reason = passes_fundamentals(row)
             log.info("%s momentum ok, fundamentals: %s", t, reason)
             if ok:
                 passed[t] = s
+            else:
+                rejected.append(f"{t.replace('.NS', '')} ({reason})")
         # 3) trade construction + ranking, skip tickers already open
         already = set(open_tickers)
         cands = []
@@ -440,7 +450,8 @@ def main():
         cands.sort(key=lambda x: x["score"], reverse=True)
         picks = cands[:CONFIG["top_n"]]
         stats = {"scanned": sum(t in prices for t in universe), "momentum": len(mom),
-                 "fundamental": len(passed), "tradeable": len(cands)}
+                 "fundamental": len(passed), "tradeable": len(cands),
+                 "rejected": rejected}
 
         new_rows = [{"signal_date": data_date.isoformat(), "ticker": p["ticker"],
                      "ref_close": p["ref_close"], "stop": p["stop"], "target": p["target"],

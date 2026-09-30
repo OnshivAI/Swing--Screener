@@ -1,0 +1,10 @@
+NSE Swing Screener - 30 Sep 2026
+Data as of: 30 Sep 2026
+Scanned 250 | momentum pass 4 | fundamental pass 0 | risk-ok 0
+Momentum ok but failed fundamentals: ADANIPORTS (missing returnOnEquity); AJANTPHARM (missing returnOnEquity); KOTAKBANK (missing returnOnEquity); MANKIND (missing returnOnEquity)
+
+No setup met all rules today. No trade is a valid outcome.
+
+Paper record: no closed trades yet | open/pending: 0
+
+Signals only. Not investment advice. Rules not backtested - verify before trading.

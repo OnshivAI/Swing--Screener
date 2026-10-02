@@ -1,5 +1,5 @@
 NSE Swing Screener - 02 Oct 2026
-Data as of: 30 Sep 2026
+Data as of: 01 Oct 2026
 Today's bar not available (holiday or data delay). No new signals.
 
 Paper record: no closed trades yet | open/pending: 0

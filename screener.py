@@ -453,8 +453,10 @@ def _fmt_pct(x, scale=100):
 def fund_line(p) -> str:
     sym = p["ticker"].replace(".NS", "")
     d = p.get("fund", {})
-    vals = (f"ROE {_fmt_pct(d.get('roe'))} | margin {_fmt_pct(d.get('pm'))} | "
-            f"D/E {'n/a' if d.get('de') is None else f'{float(d['de']) / 100:.2f}x'}")
+    de = d.get("de")
+    de_txt = "n/a" if de is None else "{:.2f}x".format(float(de) / 100)
+    roe_txt, pm_txt = _fmt_pct(d.get("roe")), _fmt_pct(d.get("pm"))
+    vals = f"ROE {roe_txt} | margin {pm_txt} | D/E {de_txt}"
     if p["fund_status"] == "unverified":
         return (f"  Fundamentals: NOT VERIFIED ({p['fund_reason']}) - check manually: "
                 f"https://www.screener.in/company/{sym}/\n  Known: {vals}")

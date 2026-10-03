@@ -2,17 +2,32 @@ name: Daily swing screener
 
 on:
   schedule:
-        - cron: "47 12 * * 1-5"   # 12:47 UTC = 18:17 IST, Mon-Fri
-  workflow_dispatch:           # "Run workflow" button for manual runs
+    # Three attempts (IST): 17:17, 18:47, 20:17, Mon-Fri.
+    # The first run that gets today's data sends the report; later runs exit quietly.
+    - cron: "47 11 * * 1-5"
+    - cron: "17 13 * * 1-5"
+    - cron: "47 14 * * 1-5"
+  workflow_dispatch:
+    inputs:
+      force:
+        description: "Run even if today's report was already sent"
+        type: boolean
+        default: false
 
 permissions:
   contents: write              # needed to commit data/ back to the repo
+
+concurrency:
+  group: swing-screener        # never run two at once
+  cancel-in-progress: false
 
 jobs:
   screen:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: main            # latest commit, so a queued run sees today's marker file
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
@@ -24,11 +39,12 @@ jobs:
           EMAIL_USER: ${{ secrets.EMAIL_USER }}
           EMAIL_APP_PASSWORD: ${{ secrets.EMAIL_APP_PASSWORD }}
           EMAIL_TO: ${{ secrets.EMAIL_TO }}
-        run: python screener.py
+        run: python screener.py ${{ inputs.force && '--force' || '' }}
       - name: Save signal log and reports
         run: |
           git config user.name "screener-bot"
           git config user.email "screener-bot@users.noreply.github.com"
           git add data/
           git diff --cached --quiet || git commit -m "Screener run $(date -u +%F)"
+          git pull --rebase origin main
           git push

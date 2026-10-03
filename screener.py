@@ -47,7 +47,7 @@ CONFIG = {
     "min_roe": 0.12,                 # 12%
     "max_trailing_pe": 60,
     "skip_de_for_sectors": ["Financial Services"],  # D/E not meaningful for banks/NBFCs
-    "allow_missing_fundamentals": False,
+    "missing_fundamentals": "flag",   # "flag" = keep pick, mark unverified | "reject"
     "require_debt_to_equity": False,  # Yahoo often omits D/E (e.g. for low/no-debt firms)
 
     # Momentum gate
@@ -67,6 +67,9 @@ CONFIG = {
     "round_trip_cost_pct": 0.20,     # APPROXIMATE - confirm with your broker's contract notes
     "max_hold_days": 8,              # time exit after N sessions
     "top_n": 2,
+
+    # Scheduling: runs before this IST hour stay silent if data is not ready (a later run retries)
+    "final_attempt_hour_ist": 20,
 }
 
 IST = timezone(timedelta(hours=5, minutes=30))
@@ -75,11 +78,12 @@ DATA = BASE / "data"
 REPORTS = DATA / "reports"
 SIGNAL_LOG = DATA / "signals.csv"
 FUND_CACHE = DATA / "fundamentals.csv"
+MARKER = DATA / "last_report_date.txt"
 
 LOG_COLUMNS = [
     "signal_date", "ticker", "ref_close", "stop", "target", "risk_pct", "target_pct",
     "rsi", "vol_ratio", "score", "status", "entry_date", "entry_price",
-    "exit_date", "exit_price", "net_result_pct",
+    "exit_date", "exit_price", "net_result_pct", "fund_status",
 ]
 FUND_FIELDS = ["debtToEquity", "profitMargins", "returnOnEquity",
                "trailingPE", "forwardPE", "sector"]
@@ -165,30 +169,101 @@ def get_prices(tickers: list) -> dict:
     return frames
 
 
+def _statement_row(df, names):
+    """Return a date-indexed, newest-first Series for the first matching row label, else None."""
+    if df is None or getattr(df, "empty", True):
+        return None
+    for n in names:
+        if n in df.index:
+            s = df.loc[n]
+            if isinstance(s, pd.DataFrame):
+                s = s.iloc[0]
+            s = pd.to_numeric(s, errors="coerce").dropna()
+            if len(s):
+                s.index = pd.to_datetime(s.index, errors="coerce")
+                return s[s.index.notna()].sort_index(ascending=False)
+    return None
+
+
+def _same_year_ratio(num, den, positive_den=True):
+    """num/den using the most recent fiscal year present in BOTH series."""
+    if num is None or den is None:
+        return None
+    common = [d for d in num.index if d in den.index]
+    if not common:
+        return None
+    d = max(common)
+    n, m = float(num[d]), float(den[d])
+    if m == 0 or (positive_den and m < 0):
+        return None
+    return n / m
+
+
+# Row labels vary between companies/yfinance versions - first match wins (verify on real data)
+ROW_NET_INCOME = ["Net Income", "Net Income Common Stockholders",
+                  "Net Income From Continuing Operation Net Minority Interest"]
+ROW_REVENUE = ["Total Revenue", "Operating Revenue"]
+ROW_EQUITY = ["Stockholders Equity", "Common Stock Equity",
+              "Total Equity Gross Minority Interest"]
+ROW_DEBT = ["Total Debt"]
+
+
+def statement_ratios(tk) -> dict:
+    """Calculate margin, ROE and D/E from annual statements (layer 2 fallback)."""
+    try:
+        inc, bs = tk.financials, tk.balance_sheet
+    except Exception as e:
+        log.debug("Statements unavailable: %s", e)
+        return {}
+    ni = _statement_row(inc, ROW_NET_INCOME)
+    rev = _statement_row(inc, ROW_REVENUE)
+    eq = _statement_row(bs, ROW_EQUITY)
+    debt = _statement_row(bs, ROW_DEBT)
+    out = {"profitMargins": _same_year_ratio(ni, rev),
+           "returnOnEquity": _same_year_ratio(ni, eq)}
+    de = _same_year_ratio(debt, eq)
+    out["debtToEquity"] = None if de is None else de * 100   # same x100 convention as .info
+    return {k: v for k, v in out.items() if v is not None}
+
+
 def get_fundamentals(tickers: list) -> pd.DataFrame:
-    """Fetch .info only for the given tickers, reusing a cache for N days."""
+    """Layer 1: yfinance .info ratios. Layer 2: calculate missing ones from statements.
+    Results cached for N days."""
     today = datetime.now(IST).date()
+    cols = ["ticker", "fetched_at", "src"] + FUND_FIELDS
     cache = {}
     if FUND_CACHE.exists():
-        for rec in pd.read_csv(FUND_CACHE).to_dict("records"):
-            cache[rec["ticker"]] = rec
+        old = pd.read_csv(FUND_CACHE)
+        if "src" in old.columns:                     # ignore caches from older script versions
+            cache = {r["ticker"]: r for r in old.to_dict("records")}
 
     for t in tickers:
         if t in cache:
             fetched = pd.to_datetime(cache[t]["fetched_at"]).date()
             if (today - fetched).days < CONFIG["fundamentals_cache_days"]:
                 continue
+        tk = yf.Ticker(t)
         try:
-            info = yf.Ticker(t).info or {}
+            info = tk.info or {}
         except Exception as e:
             log.warning("Fundamentals fetch failed for %s: %s", t, e)
             info = {}
         row = {k: info.get(k) for k in FUND_FIELDS}
-        if any(v is not None for v in row.values()):   # only cache real data
-            cache[t] = {"ticker": t, "fetched_at": today.isoformat(), **row}
+        src = "ratios"
+        need = [k for k in ("profitMargins", "returnOnEquity", "debtToEquity") if row.get(k) is None]
+        if need:
+            calc = statement_ratios(tk)
+            filled = [k for k in need if k in calc]
+            for k in filled:
+                row[k] = calc[k]
+            if filled:
+                src = "calculated" if len(filled) == 3 else "ratios+calculated"
+                log.info("%s: calculated from statements: %s", t, ", ".join(filled))
+        if any(v is not None for v in row.values()):  # only cache real data
+            cache[t] = {"ticker": t, "fetched_at": today.isoformat(), "src": src, **row}
         time.sleep(0.5)
 
-    df = pd.DataFrame(list(cache.values()), columns=["ticker", "fetched_at"] + FUND_FIELDS)
+    df = pd.DataFrame(list(cache.values()), columns=cols)
     df.to_csv(FUND_CACHE, index=False)
     return df.set_index("ticker")
 
@@ -224,35 +299,38 @@ def momentum_signal(df: pd.DataFrame):
             "vol_ratio": float(vol_ratio), "score": float(score)}
 
 
-def passes_fundamentals(row: pd.Series):
+def evaluate_fundamentals(row):
+    """Returns (status, reason, details). status: 'pass' | 'fail' | 'unverified'."""
     def val(k):
         x = row.get(k) if row is not None else None
         return None if x is None or (isinstance(x, float) and np.isnan(x)) else x
 
     if row is None:
-        return CONFIG["allow_missing_fundamentals"], "no data"
+        return "unverified", "no fundamental data", {}
     sector = val("sector")
     de, pm, roe, pe = (val("debtToEquity"), val("profitMargins"),
                        val("returnOnEquity"), val("trailingPE"))
+    details = {"roe": roe, "pm": pm, "de": de, "pe": pe, "src": val("src") or "ratios"}
     skip_de = sector in CONFIG["skip_de_for_sectors"]
 
-    required = {"profitMargins": pm, "returnOnEquity": roe}
-    if CONFIG["require_debt_to_equity"] and not skip_de:
-        required["debtToEquity"] = de
-    missing = [k for k, x in required.items() if x is None]
-    if missing:
-        return CONFIG["allow_missing_fundamentals"], "missing " + ", ".join(missing)
+    # 1) any value that IS available and breaks a rule -> fail
     if not skip_de and de is not None and float(de) > CONFIG["max_debt_to_equity"]:
-        return False, "high D/E"
-    if float(pm) < CONFIG["min_profit_margin"]:
-        return False, "low margin"
-    if float(roe) < CONFIG["min_roe"]:
-        return False, "low ROE"
+        return "fail", "high D/E", details
+    if pm is not None and float(pm) < CONFIG["min_profit_margin"]:
+        return "fail", "low margin", details
+    if roe is not None and float(roe) < CONFIG["min_roe"]:
+        return "fail", "low ROE", details
     if pe is not None and (float(pe) <= 0 or float(pe) > CONFIG["max_trailing_pe"]):
-        return False, "P/E out of range"
-    if de is None and not skip_de:
-        return True, "ok (D/E not reported)"
-    return True, "ok"
+        return "fail", "P/E out of range", details
+
+    # 2) required values missing -> unverified (or fail, per config)
+    missing = [n for n, x in (("margin", pm), ("ROE", roe)) if x is None]
+    if CONFIG["require_debt_to_equity"] and not skip_de and de is None:
+        missing.append("D/E")
+    if missing:
+        status = "unverified" if CONFIG["missing_fundamentals"] == "flag" else "fail"
+        return status, "missing " + ", ".join(missing), details
+    return "pass", "ok", details
 
 
 def build_trade(sig: dict):
@@ -368,6 +446,23 @@ def send_email(subject: str, text: str) -> None:
         log.warning("Email send failed: %s", e)
 
 
+def _fmt_pct(x, scale=100):
+    return "n/a" if x is None else f"{float(x) * scale:.1f}%"
+
+
+def fund_line(p) -> str:
+    sym = p["ticker"].replace(".NS", "")
+    d = p.get("fund", {})
+    vals = (f"ROE {_fmt_pct(d.get('roe'))} | margin {_fmt_pct(d.get('pm'))} | "
+            f"D/E {'n/a' if d.get('de') is None else f'{float(d['de']) / 100:.2f}x'}")
+    if p["fund_status"] == "unverified":
+        return (f"  Fundamentals: NOT VERIFIED ({p['fund_reason']}) - check manually: "
+                f"https://www.screener.in/company/{sym}/\n  Known: {vals}")
+    src = {"ratios": "Yahoo ratios", "calculated": "calculated from statements",
+           "ratios+calculated": "Yahoo ratios + calculated"}.get(d.get("src"), d.get("src"))
+    return f"  Fundamentals: verified ({src})\n  {vals}"
+
+
 def format_report(run_date, data_date, stats, picks, record, note=""):
     lines = [f"NSE Swing Screener - {run_date:%d %b %Y}",
              f"Data as of: {data_date:%d %b %Y}"]
@@ -375,7 +470,8 @@ def format_report(run_date, data_date, stats, picks, record, note=""):
         lines.append(note)
     if stats:
         lines.append(f"Scanned {stats['scanned']} | momentum pass {stats['momentum']} | "
-                     f"fundamental pass {stats['fundamental']} | risk-ok {stats['tradeable']}")
+                     f"fundamental pass {stats['fundamental']} (unverified {stats['unverified']}) | "
+                     f"risk-ok {stats['tradeable']}")
         if stats.get("rejected"):
             lines.append("Momentum ok but failed fundamentals: " + "; ".join(stats["rejected"]))
     lines.append("")
@@ -389,6 +485,8 @@ def format_report(run_date, data_date, stats, picks, record, note=""):
                 f"  Target    : Rs {p['target']} (+{p['target_pct']}%, ~{net:.2f}% net of est. costs)",
                 f"  R:R {p['rr']} | RSI {p['rsi']:.1f} | Vol {p['vol_ratio']:.1f}x | "
                 f"time exit {CONFIG['max_hold_days']} sessions",
+                fund_line(p),
+                "  Also check: no quarterly results due within the holding period.",
                 "",
             ]
     elif stats:
@@ -408,23 +506,36 @@ def main():
     DATA.mkdir(exist_ok=True)
     REPORTS.mkdir(exist_ok=True)
 
+    now = datetime.now(IST)
+    run_date = now.date()
+    # Scheduled runs fire up to 3 times a day; only the first successful one reports.
+    scheduled = os.getenv("GITHUB_EVENT_NAME") == "schedule"
+    if not force and MARKER.exists() and MARKER.read_text().strip() == run_date.isoformat():
+        log.info("Today's report was already sent - nothing to do.")
+        return
+
     universe = load_universe()
     log_df = load_signal_log()
     open_tickers = log_df.loc[log_df["status"].isin(["PENDING", "OPEN"]), "ticker"].tolist()
     prices = get_prices(sorted(set(universe) | set(open_tickers)))
     if not prices:
+        if scheduled and now.hour < CONFIG["final_attempt_hour_ist"]:
+            log.warning("No price data; a later scheduled run will retry.")
+            return
         err = "Screener: no price data received. Check yfinance / network."
         send_telegram(err)
         send_email("Swing Screener: data error", err)
         sys.exit(1)
 
-    run_date = datetime.now(IST).date()
     data_date = max(df.index[-1] for df in prices.values()).date()
-
     log_df = evaluate_open(log_df, prices)
 
     picks, stats, note = [], None, ""
     if data_date != run_date and not force:
+        if scheduled and now.hour < CONFIG["final_attempt_hour_ist"]:
+            log_df.reindex(columns=LOG_COLUMNS).to_csv(SIGNAL_LOG, index=False)
+            log.info("Today's bar not available yet; a later scheduled run will retry.")
+            return
         note = "Today's bar not available (holiday or data delay). No new signals."
     else:
         # 1) momentum on everything (local, fast)
@@ -434,30 +545,32 @@ def main():
         passed, rejected = {}, []
         for t, s in mom.items():
             row = fund.loc[t] if len(fund) and t in fund.index else None
-            ok, reason = passes_fundamentals(row)
-            log.info("%s momentum ok, fundamentals: %s", t, reason)
-            if ok:
-                passed[t] = s
-            else:
+            status, reason, details = evaluate_fundamentals(row)
+            log.info("%s momentum ok, fundamentals: %s (%s)", t, status, reason)
+            if status == "fail":
                 rejected.append(f"{t.replace('.NS', '')} ({reason})")
-        # 3) trade construction + ranking, skip tickers already open
+            else:
+                passed[t] = {**s, "fund_status": status, "fund_reason": reason, "fund": details}
+        # 3) trade construction + ranking: verified before unverified, then score
         already = set(open_tickers)
         cands = []
         for t, s in passed.items():
             tr = build_trade(s)
             if tr and t not in already:
                 cands.append({"ticker": t, **s, **tr})
-        cands.sort(key=lambda x: x["score"], reverse=True)
+        cands.sort(key=lambda x: (x["fund_status"] == "pass", x["score"]), reverse=True)
         picks = cands[:CONFIG["top_n"]]
         stats = {"scanned": sum(t in prices for t in universe), "momentum": len(mom),
-                 "fundamental": len(passed), "tradeable": len(cands),
-                 "rejected": rejected}
+                 "fundamental": len(passed),
+                 "unverified": sum(v["fund_status"] == "unverified" for v in passed.values()),
+                 "tradeable": len(cands), "rejected": rejected}
 
         new_rows = [{"signal_date": data_date.isoformat(), "ticker": p["ticker"],
                      "ref_close": p["ref_close"], "stop": p["stop"], "target": p["target"],
                      "risk_pct": p["risk_pct"], "target_pct": p["target_pct"],
                      "rsi": round(p["rsi"], 1), "vol_ratio": round(p["vol_ratio"], 2),
-                     "score": round(p["score"], 1), "status": "PENDING"} for p in picks]
+                     "score": round(p["score"], 1), "status": "PENDING",
+                     "fund_status": p["fund_status"]} for p in picks]
         if new_rows:
             log_df = pd.concat([log_df, pd.DataFrame(new_rows)], ignore_index=True)
 
@@ -468,12 +581,14 @@ def main():
     send_telegram(report)
     if picks:
         subject = f"Swing picks {run_date:%d %b}: " + ", ".join(
-            p["ticker"].replace(".NS", "") for p in picks)
+            p["ticker"].replace(".NS", "") + ("*" if p["fund_status"] == "unverified" else "")
+            for p in picks)
     elif note:
         subject = f"Swing Screener {run_date:%d %b}: no run (data not updated)"
     else:
         subject = f"Swing Screener {run_date:%d %b}: no setup today"
     send_email(subject, report)
+    MARKER.write_text(run_date.isoformat())
 
 
 if __name__ == "__main__":

@@ -37,7 +37,7 @@ except ImportError:  # allows offline testing with a mock
 # --------------------------------------------------------------------------
 CONFIG = {
     "universe_file": "universe.csv",
-    "price_period": "1y",
+    "price_period": "2y",           # 2 years: enough history for the backtest
     "download_batch": 50,
     "fundamentals_cache_days": 7,
 
@@ -67,6 +67,10 @@ CONFIG = {
     "round_trip_cost_pct": 0.20,     # APPROXIMATE - confirm with your broker's contract notes
     "max_hold_days": 8,              # time exit after N sessions
     "top_n": 2,
+
+    # Reporting / backtest
+    "recent_sessions": 10,           # picks table covers the last N trading sessions
+    "backtest_warmup": 60,           # skip first N bars while indicators settle
 
     # Scheduling: runs before this IST hour stay silent if data is not ready (a later run retries)
     "final_attempt_hour_ist": 20,
@@ -271,32 +275,132 @@ def get_fundamentals(tickers: list) -> pd.DataFrame:
 # --------------------------------------------------------------------------
 # Gates
 # --------------------------------------------------------------------------
-def momentum_signal(df: pd.DataFrame):
+def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
+    """All momentum indicators as full time series (causal - each row uses only past data).
+    Used both for today's screen and for the backtest, so both apply identical rules."""
     c, h, l, v = df["Close"], df["High"], df["Low"], df["Volume"]
-    e_fast, e_slow = ema(c, CONFIG["ema_fast"]), ema(c, CONFIG["ema_slow"])
-    r = rsi(c, CONFIG["rsi_period"])
-    a = atr(h, l, c, CONFIG["atr_period"])
+    out = pd.DataFrame(index=df.index)
+    out["close"] = c
+    out["e_fast"] = ema(c, CONFIG["ema_fast"])
+    out["e_slow"] = ema(c, CONFIG["ema_slow"])
+    out["rsi"] = rsi(c, CONFIG["rsi_period"])
+    out["atr"] = atr(h, l, c, CONFIG["atr_period"])
+    vol_avg_prior = v.shift(1).rolling(20).mean()          # prior 20 sessions, excludes today
+    out["vol_ratio"] = v / vol_avg_prior.where(vol_avg_prior > 0)
+    out["turnover_cr"] = (c * v).rolling(20).mean() / 1e7
+    out["signal"] = (
+        (c > out["e_fast"]) & (out["e_fast"] > out["e_slow"])
+        & out["rsi"].between(CONFIG["rsi_min"], CONFIG["rsi_max"])
+        & (out["vol_ratio"] >= CONFIG["volume_mult"])
+        & (out["turnover_cr"] >= CONFIG["min_avg_turnover_cr"])
+    ).fillna(False)
+    out["score"] = (out["rsi"] - 50) + 10 * out["vol_ratio"].clip(upper=4.0)
+    return out
 
-    close, rsi_now, atr_now = c.iloc[-1], r.iloc[-1], a.iloc[-1]
-    vol_avg_prior = v.iloc[-21:-1].mean()           # excludes today's bar
-    turnover_cr = (c * v).iloc[-20:].mean() / 1e7
 
-    if any(pd.isna(x) for x in (rsi_now, atr_now, vol_avg_prior)) or vol_avg_prior <= 0:
+def momentum_signal(df: pd.DataFrame):
+    ind = compute_indicators(df)
+    last = ind.iloc[-1]
+    if not bool(last["signal"]) or pd.isna(last["atr"]):
         return None
-    vol_ratio = v.iloc[-1] / vol_avg_prior
+    return {"close": float(last["close"]), "rsi": float(last["rsi"]), "atr": float(last["atr"]),
+            "vol_ratio": float(last["vol_ratio"]), "score": float(last["score"])}
 
-    checks = (
-        close > e_fast.iloc[-1] > e_slow.iloc[-1],
-        CONFIG["rsi_min"] <= rsi_now <= CONFIG["rsi_max"],
-        vol_ratio >= CONFIG["volume_mult"],
-        turnover_cr >= CONFIG["min_avg_turnover_cr"],
-    )
-    if not all(checks):
-        return None
 
-    score = (rsi_now - 50) + 10 * min(vol_ratio, 4.0)   # cap volume influence
-    return {"close": float(close), "rsi": float(rsi_now), "atr": float(atr_now),
-            "vol_ratio": float(vol_ratio), "score": float(score)}
+# --------------------------------------------------------------------------
+# Backtest (price rules only - fundamentals cannot be tested without look-ahead)
+# --------------------------------------------------------------------------
+def simulate_trades(df: pd.DataFrame, ind: pd.DataFrame = None) -> list:
+    """Replays the exact daily rules on past data: signal at close, entry next open,
+    exit at stop / target / time. One trade at a time per stock. Returns net % results."""
+    if ind is None:
+        ind = compute_indicators(df)
+    o, h, l, c = (df[k].to_numpy() for k in ("Open", "High", "Low", "Close"))
+    sig, atr_v = ind["signal"].to_numpy(), ind["atr"].to_numpy()
+    cost, n = CONFIG["round_trip_cost_pct"], len(df)
+    trades, busy_until = [], -1
+    for i in range(CONFIG["backtest_warmup"], n - 1):
+        if i <= busy_until or not sig[i] or np.isnan(atr_v[i]):
+            continue
+        stop = c[i] - CONFIG["atr_stop_mult"] * atr_v[i]
+        if (c[i] - stop) / c[i] * 100 > CONFIG["max_risk_pct"]:
+            continue                                  # same risk cap as live trade cards
+        target = c[i] * (1 + CONFIG["target_pct"] / 100)
+        entry = o[i + 1]
+        if entry >= target or entry <= stop:
+            continue                                  # gap through a level -> no trade
+        exit_px, outcome, j = None, None, i + 1
+        for j in range(i + 1, n):
+            if l[j] <= stop:
+                exit_px, outcome = stop, "STOP"
+                break
+            if h[j] >= target:
+                exit_px, outcome = target, "TARGET"
+                break
+            if j - i >= CONFIG["max_hold_days"]:
+                exit_px, outcome = c[j], "TIME_EXIT"
+                break
+        if exit_px is None:
+            break                                     # trade still open at end of data
+        trades.append({"date": df.index[i].date(), "outcome": outcome,
+                       "net_pct": (exit_px - entry) / entry * 100 - cost})
+        busy_until = j
+    return trades
+
+
+def summarize_trades(trades: list) -> dict:
+    if not trades:
+        return {"n": 0}
+    r = np.array([t["net_pct"] for t in trades])
+    wins, losses = r[r > 0], r[r <= 0]
+    pf = wins.sum() / abs(losses.sum()) if losses.sum() != 0 else float("inf")
+    return {"n": len(r), "win_rate": (r > 0).mean() * 100, "avg": r.mean(),
+            "best": r.max(), "worst": r.min(), "profit_factor": pf,
+            "targets": sum(t["outcome"] == "TARGET" for t in trades),
+            "stops": sum(t["outcome"] == "STOP" for t in trades),
+            "time_exits": sum(t["outcome"] == "TIME_EXIT" for t in trades)}
+
+
+def backtest_line(s: dict, label: str) -> str:
+    if s["n"] == 0:
+        return f"{label}: no past signals in the data window"
+    pf = "inf" if s["profit_factor"] == float("inf") else f"{s['profit_factor']:.2f}"
+    return (f"{label}: {s['n']} trades | win {s['win_rate']:.0f}% | avg net {s['avg']:+.2f}% | "
+            f"PF {pf} | target/stop/time {s['targets']}/{s['stops']}/{s['time_exits']}")
+
+
+# --------------------------------------------------------------------------
+# Recent picks table
+# --------------------------------------------------------------------------
+def recent_picks_table(log_df: pd.DataFrame, prices: dict) -> str:
+    if log_df.empty:
+        return "No picks in the last %d sessions." % CONFIG["recent_sessions"]
+    # last N trading dates, taken from the price calendar
+    cal = sorted({d.date() for df in prices.values() for d in df.index[-60:]})
+    start = cal[-CONFIG["recent_sessions"]] if len(cal) >= CONFIG["recent_sessions"] else cal[0]
+    recent = log_df[pd.to_datetime(log_df["signal_date"]).dt.date >= start]
+    if recent.empty:
+        return "No picks in the last %d sessions." % CONFIG["recent_sessions"]
+
+    rows = [f"{'Date':<7}{'Stock':<12}{'Entry':>9}{'Last/Exit':>11}{'P&L%':>8}  Status"]
+    cost = CONFIG["round_trip_cost_pct"]
+    for _, r in recent.sort_values("signal_date").iterrows():
+        sym = r["ticker"].replace(".NS", "") + ("*" if r.get("fund_status") == "unverified" else "")
+        date = pd.to_datetime(r["signal_date"]).strftime("%d-%b")
+        entry = pd.to_numeric(r.get("entry_price"), errors="coerce")
+        status = r["status"]
+        if status in ("STOP", "TARGET", "TIME_EXIT"):
+            last = pd.to_numeric(r["exit_price"], errors="coerce")
+            pnl = pd.to_numeric(r["net_result_pct"], errors="coerce")
+        elif status == "OPEN" and r["ticker"] in prices:
+            last = float(prices[r["ticker"]]["Close"].iloc[-1])
+            pnl = (last - entry) / entry * 100 - cost       # unrealised, after est. costs
+        else:
+            last, pnl = np.nan, np.nan
+        fmt = lambda x, w, f: "-".rjust(w) if pd.isna(x) else format(float(x), f).rjust(w)
+        rows.append(f"{date:<7}{sym[:11]:<12}{fmt(entry, 9, '.2f')}{fmt(last, 11, '.2f')}"
+                    f"{fmt(pnl, 8, '+.2f')}  {status}")
+    return "\n".join(rows)
 
 
 def evaluate_fundamentals(row):
@@ -437,6 +541,10 @@ def send_email(subject: str, text: str) -> None:
     msg = EmailMessage()
     msg["Subject"], msg["From"], msg["To"] = subject, user, to
     msg.set_content(text)
+    import html as _html
+    msg.add_alternative(
+        '<pre style="font-family:Menlo,Consolas,monospace;font-size:12px;">'
+        + _html.escape(text) + "</pre>", subtype="html")
     try:
         with smtplib.SMTP_SSL("smtp.gmail.com", 465, timeout=30) as smtp:
             smtp.login(user, pwd.replace(" ", ""))
@@ -465,7 +573,8 @@ def fund_line(p) -> str:
     return f"  Fundamentals: verified ({src})\n  {vals}"
 
 
-def format_report(run_date, data_date, stats, picks, record, note=""):
+def format_report(run_date, data_date, stats, picks, record, note="",
+                  recent_table="", strategy_bt=None):
     lines = [f"NSE Swing Screener - {run_date:%d %b %Y}",
              f"Data as of: {data_date:%d %b %Y}"]
     if note:
@@ -488,13 +597,22 @@ def format_report(run_date, data_date, stats, picks, record, note=""):
                 f"  R:R {p['rr']} | RSI {p['rsi']:.1f} | Vol {p['vol_ratio']:.1f}x | "
                 f"time exit {CONFIG['max_hold_days']} sessions",
                 fund_line(p),
+                "  " + backtest_line(p["bt"], "Backtest, this stock (2y)"),
                 "  Also check: no quarterly results due within the holding period.",
                 "",
             ]
     elif stats:
         lines += ["No setup met all rules today. No trade is a valid outcome.", ""]
-    lines += [record, "",
-              "Signals only. Not investment advice. Rules not backtested - verify before trading."]
+    lines += [record, ""]
+    if recent_table:
+        lines += [f"Picks - last {CONFIG['recent_sessions']} sessions (* = fundamentals unverified):",
+                  recent_table, ""]
+    if strategy_bt is not None:
+        lines += [backtest_line(strategy_bt, "Strategy backtest, all stocks (2y)"),
+                  "Backtest notes: price rules only (no fundamentals), current index members only "
+                  "(survivorship bias), costs estimated. Past results do not guarantee future ones.",
+                  ""]
+    lines += ["Signals only. Not investment advice."]
     return "\n".join(lines)
 
 
@@ -562,6 +680,8 @@ def main():
                 cands.append({"ticker": t, **s, **tr})
         cands.sort(key=lambda x: (x["fund_status"] == "pass", x["score"]), reverse=True)
         picks = cands[:CONFIG["top_n"]]
+        for p in picks:
+            p["bt"] = summarize_trades(simulate_trades(prices[p["ticker"]]))
         stats = {"scanned": sum(t in prices for t in universe), "momentum": len(mom),
                  "fundamental": len(passed),
                  "unverified": sum(v["fund_status"] == "unverified" for v in passed.values()),
@@ -577,7 +697,13 @@ def main():
             log_df = pd.concat([log_df, pd.DataFrame(new_rows)], ignore_index=True)
 
     log_df.reindex(columns=LOG_COLUMNS).to_csv(SIGNAL_LOG, index=False)
-    report = format_report(run_date, data_date, stats, picks, track_record(log_df), note)
+    all_trades = []
+    for t in universe:
+        if t in prices:
+            all_trades += simulate_trades(prices[t])
+    strategy_bt = summarize_trades(all_trades)
+    report = format_report(run_date, data_date, stats, picks, track_record(log_df), note,
+                           recent_picks_table(log_df, prices), strategy_bt)
     (REPORTS / f"{run_date.isoformat()}.txt").write_text(report, encoding="utf-8")
     print(report)
     send_telegram(report)

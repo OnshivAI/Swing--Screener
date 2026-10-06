@@ -373,6 +373,31 @@ def backtest_line(s: dict, label: str) -> str:
 # --------------------------------------------------------------------------
 # Recent picks table
 # --------------------------------------------------------------------------
+def recent_pick_rows(log_df: pd.DataFrame, prices: dict) -> list:
+    if log_df.empty:
+        return []
+    cal = sorted({d.date() for df in prices.values() for d in df.index[-60:]})
+    start = cal[-CONFIG["recent_sessions"]] if len(cal) >= CONFIG["recent_sessions"] else cal[0]
+    recent = log_df[pd.to_datetime(log_df["signal_date"]).dt.date >= start]
+    rows, cost = [], CONFIG["round_trip_cost_pct"]
+    for _, r in recent.sort_values("signal_date").iterrows():
+        entry = pd.to_numeric(r.get("entry_price"), errors="coerce")
+        status = r["status"]
+        if status in ("STOP", "TARGET", "TIME_EXIT"):
+            last = pd.to_numeric(r["exit_price"], errors="coerce")
+            pnl = pd.to_numeric(r["net_result_pct"], errors="coerce")
+        elif status == "OPEN" and r["ticker"] in prices:
+            last = float(prices[r["ticker"]]["Close"].iloc[-1])
+            pnl = (last - entry) / entry * 100 - cost
+        else:
+            last, pnl = np.nan, np.nan
+        rows.append({"date": pd.to_datetime(r["signal_date"]).strftime("%d %b"),
+                     "symbol": r["ticker"].replace(".NS", ""),
+                     "unverified": r.get("fund_status") == "unverified",
+                     "entry": entry, "last": last, "pnl": pnl, "status": status})
+    return rows
+
+
 def recent_picks_table(log_df: pd.DataFrame, prices: dict) -> str:
     if log_df.empty:
         return "No picks in the last %d sessions." % CONFIG["recent_sessions"]
@@ -530,7 +555,7 @@ def send_telegram(text: str) -> None:
         log.warning("Telegram send failed: %s", e)
 
 
-def send_email(subject: str, text: str) -> None:
+def send_email(subject: str, text: str, html_body: str = None) -> None:
     """Gmail via SMTP with an App Password (needs 2-Step Verification on the Google account)."""
     user, pwd = os.getenv("EMAIL_USER"), os.getenv("EMAIL_APP_PASSWORD")
     to = os.getenv("EMAIL_TO") or user
@@ -542,10 +567,8 @@ def send_email(subject: str, text: str) -> None:
     msg = EmailMessage()
     msg["Subject"], msg["From"], msg["To"] = subject, user, to
     msg.set_content(text)
-    import html as _html
-    msg.add_alternative(
-        '<pre style="font-family:Menlo,Consolas,monospace;font-size:12px;">'
-        + _html.escape(text) + "</pre>", subtype="html")
+    if html_body:
+        msg.add_alternative(html_body, subtype="html")
     try:
         with smtplib.SMTP_SSL("smtp.gmail.com", 465, timeout=30) as smtp:
             smtp.login(user, pwd.replace(" ", ""))
@@ -553,6 +576,213 @@ def send_email(subject: str, text: str) -> None:
         log.info("Email sent to %s", to)
     except Exception as e:
         log.warning("Email send failed: %s", e)
+
+
+# --------------------------------------------------------------------------
+# HTML email (inline styles only - Gmail strips most <style> rules)
+# --------------------------------------------------------------------------
+C_INK, C_SLATE, C_RULE, C_PANEL = "#17223B", "#5D6878", "#E4E7EC", "#F5F7FA"
+C_GAIN, C_LOSS, C_CAUTION = "#13795B", "#B42318", "#A15C07"
+FONT = "-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif"
+NUM = "font-variant-numeric:tabular-nums;"
+
+
+def _e(x) -> str:
+    import html as _h
+    return _h.escape(str(x))
+
+
+def _rs(x) -> str:
+    return "-" if x is None or pd.isna(x) else "&#8377;{:,.2f}".format(float(x))
+
+
+def _signed(x, color=True) -> str:
+    if x is None or pd.isna(x):
+        return "-"
+    x = float(x)
+    txt = "{:+.2f}%".format(x)
+    if not color:
+        return txt
+    col = C_GAIN if x > 0 else (C_LOSS if x < 0 else C_SLATE)
+    return '<span style="color:{};">{}</span>'.format(col, txt)
+
+
+def _verdict(picks, stats, note):
+    if note:
+        return "No report for this session", note
+    if picks:
+        n = len(picks)
+        return ("{} setup{} for the next session".format(n, "" if n == 1 else "s"),
+                "Entries are reference prices from today's close. Check each one before trading.")
+    if not stats:
+        return "No trade today", ""
+    if stats["momentum"] == 0:
+        why = "No stock met all the momentum rules today."
+    elif stats["fundamental"] == 0:
+        why = "{} stock{} had momentum, but none passed the fundamental checks.".format(
+            stats["momentum"], "" if stats["momentum"] == 1 else "s")
+    else:
+        why = ("{} passed momentum and fundamentals, but none had a stop within {}% "
+               "of the price.").format(stats["fundamental"], CONFIG["max_risk_pct"])
+    return "No trade today", why + " Sitting out is a valid outcome."
+
+
+def _funnel(stats) -> str:
+    steps = [(stats["scanned"], "scanned"), (stats["momentum"], "momentum"),
+             (stats["fundamental"], "fundamentals"), (stats["tradeable"], "within risk")]
+    cells = []
+    for i, (num, label) in enumerate(steps):
+        border = "" if i == 0 else "border-left:1px solid {};".format(C_RULE)
+        cells.append(
+            '<td width="25%" style="padding:12px 8px;text-align:center;{}">'
+            '<div style="font-size:22px;font-weight:600;color:{};{}">{}</div>'
+            '<div style="font-size:12px;color:{};margin-top:2px;">{}</div></td>'.format(
+                border, C_INK, NUM, num, C_SLATE, label))
+    return ('<table width="100%" cellpadding="0" cellspacing="0" style="background:{};'
+            'border-radius:8px;margin:20px 0 8px;">{}</table>').format(C_PANEL, "<tr>" + "".join(cells) + "</tr>")
+
+
+def _pick_block(p) -> str:
+    sym = p["ticker"].replace(".NS", "")
+    d = p.get("fund", {})
+    if p["fund_status"] == "unverified":
+        badge = ('<a href="https://www.screener.in/company/{0}/" style="color:{1};font-size:12px;'
+                 'text-decoration:underline;">Fundamentals not verified, check on Screener</a>').format(_e(sym), C_CAUTION)
+    else:
+        badge = '<span style="color:{};font-size:12px;">Fundamentals verified</span>'.format(C_GAIN)
+    roe = "n/a" if d.get("roe") is None else "{:.1f}%".format(float(d["roe"]) * 100)
+    pm = "n/a" if d.get("pm") is None else "{:.1f}%".format(float(d["pm"]) * 100)
+    de = "n/a" if d.get("de") is None else "{:.2f}x".format(float(d["de"]) / 100)
+
+    def ladder_row(label, price, change, color, top_border=True):
+        tb = "border-top:1px solid {};".format(C_RULE) if top_border else ""
+        return ('<tr><td style="padding:8px 0;{tb}color:{s};font-size:13px;">{l}</td>'
+                '<td style="padding:8px 0;{tb}text-align:right;font-size:15px;font-weight:600;color:{i};{n}">{p}</td>'
+                '<td style="padding:8px 0 8px 12px;{tb}text-align:right;font-size:13px;color:{c};width:70px;{n}">{ch}</td></tr>'
+                ).format(tb=tb, s=C_SLATE, l=label, i=C_INK, n=NUM, p=_rs(price), c=color, ch=change)
+
+    ladder = (ladder_row("Target", p["target"], "+{}%".format(p["target_pct"]), C_GAIN, False)
+              + ladder_row("Entry (ref. close)", p["ref_close"], "", C_SLATE)
+              + ladder_row("Stop", p["stop"], "-{}%".format(p["risk_pct"]), C_LOSS))
+    bt = p.get("bt", {"n": 0})
+    bt_txt = ("No past signals for this stock in 2 years." if bt["n"] == 0 else
+              "Same rules on this stock, last 2 years: {} trades, {:.0f}% won, average {} per trade.".format(
+                  bt["n"], bt["win_rate"], _signed(bt["avg"])))
+    return (
+        '<table width="100%" cellpadding="0" cellspacing="0" style="border:1px solid {rule};'
+        'border-radius:8px;margin:12px 0;"><tr><td style="padding:16px;">'
+        '<div style="font-size:18px;font-weight:600;color:{ink};">{sym}</div>'
+        '<div style="margin:2px 0 10px;">{badge}</div>'
+        '<table width="100%" cellpadding="0" cellspacing="0">{ladder}</table>'
+        '<div style="font-size:13px;color:{slate};margin-top:10px;line-height:1.5;">'
+        'Reward to risk {rr} &nbsp;|&nbsp; RSI {rsi:.0f} &nbsp;|&nbsp; volume {vol:.1f}x average<br>'
+        'ROE {roe} &nbsp;|&nbsp; net margin {pm} &nbsp;|&nbsp; debt to equity {de}<br>'
+        '{bt}<br>Exit after {hold} sessions if neither level is hit. '
+        'Skip if quarterly results are due in that window.</div>'
+        '</td></tr></table>').format(rule=C_RULE, ink=C_INK, slate=C_SLATE, sym=_e(sym), badge=badge,
+                                     ladder=ladder, rr=p["rr"], rsi=p["rsi"], vol=p["vol_ratio"],
+                                     roe=roe, pm=pm, de=de, bt=bt_txt, hold=CONFIG["max_hold_days"])
+
+
+def _recent_table(rows) -> str:
+    if not rows:
+        return '<p style="font-size:14px;color:{};margin:4px 0 0;">No picks in the last {} sessions.</p>'.format(
+            C_SLATE, CONFIG["recent_sessions"])
+    status_txt = {"PENDING": "Pending", "OPEN": "Open", "TARGET": "Target",
+                  "STOP": "Stopped", "TIME_EXIT": "Time exit", "GAP_SKIP": "Gap skip"}
+    head = ''.join(
+        '<th style="padding:6px 4px;font-size:12px;font-weight:500;color:{};text-align:{};'
+        'border-bottom:1px solid {};">{}</th>'.format(C_SLATE, a, C_RULE, h)
+        for h, a in (("Date", "left"), ("Stock", "left"), ("Entry", "right"),
+                     ("Last / exit", "right"), ("P&amp;L", "right"), ("Status", "left")))
+    body = []
+    for r in rows:
+        sym = _e(r["symbol"]) + ('<span style="color:{};">*</span>'.format(C_CAUTION) if r["unverified"] else "")
+        body.append(
+            '<tr>' + ''.join('<td style="padding:7px 4px;font-size:13px;color:{};text-align:{};'
+                             'white-space:nowrap;border-bottom:1px solid {};{}">{}</td>'.format(C_INK, a, C_RULE, NUM, v)
+                             for v, a in ((r["date"], "left"), (sym, "left"),
+                                          (_rs(r["entry"]), "right"), (_rs(r["last"]), "right"),
+                                          (_signed(r["pnl"]), "right"),
+                                          (status_txt.get(r["status"], r["status"]), "left")))
+            + '</tr>')
+    return ('<table width="100%" cellpadding="0" cellspacing="0" style="margin-top:6px;">'
+            '<tr>{}</tr>{}</table>').format(head, "".join(body))
+
+
+def record_sentence(log_df: pd.DataFrame) -> str:
+    closed = log_df[log_df["status"].isin(["STOP", "TARGET", "TIME_EXIT"])]
+    open_n = int(log_df["status"].isin(["PENDING", "OPEN"]).sum())
+    tail = "{} open or pending.".format(open_n)
+    if closed.empty:
+        return "No closed paper trades yet. " + tail
+    res = pd.to_numeric(closed["net_result_pct"])
+    return "Paper trades so far: {} closed, {:.0f}% won, average {:+.2f}% per trade. {}".format(
+        len(closed), (res > 0).mean() * 100, res.mean(), tail)
+
+
+def render_html(run_date, data_date, stats, picks, record, note, recent_rows, strategy_bt) -> str:
+    title, sub = _verdict(picks, stats, note)
+    h2 = 'style="font-size:15px;font-weight:600;color:{};margin:28px 0 4px;"'.format(C_INK)
+    parts = [
+        '<div style="background:#ffffff;padding:0;margin:0;">'
+        '<table width="100%" cellpadding="0" cellspacing="0"><tr><td align="center">'
+        '<table width="100%" cellpadding="0" cellspacing="0" style="max-width:600px;font-family:{f};'
+        'color:{i};text-align:left;"><tr><td style="padding:20px 16px 32px;">'.format(f=FONT, i=C_INK),
+        '<div style="font-size:13px;color:{};">NSE swing screener, close of {}</div>'.format(
+            C_SLATE, data_date.strftime("%a %d %b %Y")),
+        '<div style="font-size:26px;line-height:1.25;font-weight:600;margin:6px 0 6px;">{}</div>'.format(_e(title)),
+        '<div style="font-size:14px;line-height:1.5;color:{};">{}</div>'.format(C_SLATE, _e(sub)),
+    ]
+    if stats:
+        parts.append(_funnel(stats))
+        if stats.get("rejected"):
+            parts.append('<div style="font-size:13px;color:{};">Failed fundamentals: {}</div>'.format(
+                C_SLATE, _e(", ".join(stats["rejected"]))))
+    if data_date != run_date and not note:
+        parts.append('<div style="font-size:13px;color:{};margin-top:6px;">Report for {}; latest data {}.</div>'.format(
+            C_CAUTION, run_date.strftime("%d %b"), data_date.strftime("%d %b")))
+    for p in picks:
+        parts.append(_pick_block(p))
+
+    parts.append('<div {}>Recent picks</div>'.format(h2))
+    parts.append('<div style="font-size:13px;color:{};">{}</div>'.format(C_SLATE, _e(record)))
+    parts.append(_recent_table(recent_rows))
+
+    if strategy_bt is not None:
+        parts.append('<div {}>Strategy backtest</div>'.format(h2))
+        if strategy_bt["n"] == 0:
+            parts.append('<div style="font-size:13px;color:{};">No trades in the 2-year window.</div>'.format(C_SLATE))
+        else:
+            pf = "&#8734;" if strategy_bt["profit_factor"] == float("inf") else "{:.2f}".format(strategy_bt["profit_factor"])
+            parts.append(_funnel_like([(strategy_bt["n"], "trades"),
+                                       ("{:.0f}%".format(strategy_bt["win_rate"]), "won"),
+                                       (_signed(strategy_bt["avg"], color=False), "avg per trade"),
+                                       (pf, "profit factor")]))
+        parts.append(
+            '<div style="font-size:12px;line-height:1.5;color:{};">All {} stocks, last 2 years, price rules only. '
+            'Fundamentals are not tested, and only current index members are included, which flatters '
+            'results. Too few trades means the numbers are not yet reliable.</div>'.format(
+                C_SLATE, stats["scanned"] if stats else "universe"))
+
+    parts.append(
+        '<div style="font-size:12px;line-height:1.5;color:{};border-top:1px solid {};margin-top:28px;'
+        'padding-top:12px;">Signals only, not investment advice. Estimated costs of {}% per round trip '
+        'are deducted from results.</div>'.format(C_SLATE, C_RULE, CONFIG["round_trip_cost_pct"]))
+    parts.append('</td></tr></table></td></tr></table></div>')
+    return "".join(parts)
+
+
+def _funnel_like(items) -> str:
+    cells = []
+    for i, (num, label) in enumerate(items):
+        border = "" if i == 0 else "border-left:1px solid {};".format(C_RULE)
+        cells.append('<td width="25%" style="padding:12px 8px;text-align:center;{}">'
+                     '<div style="font-size:18px;font-weight:600;color:{};{}">{}</div>'
+                     '<div style="font-size:12px;color:{};margin-top:2px;">{}</div></td>'.format(
+                         border, C_INK, NUM, num, C_SLATE, label))
+    return ('<table width="100%" cellpadding="0" cellspacing="0" style="background:{};border-radius:8px;'
+            'margin:8px 0;"><tr>{}</tr></table>').format(C_PANEL, "".join(cells))
 
 
 def _fmt_pct(x, scale=100):
@@ -659,6 +889,11 @@ def main():
         send_email("Swing Screener: data error", err)
         sys.exit(1)
 
+    # Drop any bar after the session being reported (e.g. today's unfinished intraday bar)
+    prices = {t: df[[d.date() <= run_date for d in df.index]] for t, df in prices.items()}
+    prices = {t: df for t, df in prices.items() if len(df) >= 60}
+    if not prices:
+        sys.exit("No usable price data after removing incomplete bars.")
     data_date = max(df.index[-1] for df in prices.values()).date()
     log_df = evaluate_open(log_df, prices)
 
@@ -727,8 +962,11 @@ def main():
     elif note:
         subject = f"Swing Screener {run_date:%d %b}: no run (data not updated)"
     else:
-        subject = f"Swing Screener {run_date:%d %b}: no setup today"
-    send_email(subject, report)
+        subject = f"Swing Screener {run_date:%d %b}: no trade today"
+    html_body = render_html(run_date, data_date, stats, picks, record_sentence(log_df), note,
+                            recent_pick_rows(log_df, prices), strategy_bt)
+    (REPORTS / f"{run_date.isoformat()}.html").write_text(html_body, encoding="utf-8")
+    send_email(subject, report, html_body)
     MARKER.write_text(run_date.isoformat())
 
 

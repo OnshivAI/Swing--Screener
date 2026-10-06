@@ -1,0 +1,16 @@
+NSE Swing Screener - 06 Oct 2026
+Data as of: 06 Oct 2026
+Scanned 250 | momentum pass 4 | fundamental pass 2 (unverified 0) | risk-ok 0
+Momentum ok but failed fundamentals: BHEL (low ROE); KOTAKBANK (low ROE)
+
+No setup met all rules today. No trade is a valid outcome.
+
+Paper record: no closed trades yet | open/pending: 0
+
+Picks - last 10 sessions (* = fundamentals unverified):
+No picks in the last 10 sessions.
+
+Strategy backtest, all stocks (2y): 2 trades | win 100% | avg net +2.04% | PF inf | target/stop/time 2/0/0
+Backtest notes: price rules only (no fundamentals), current index members only (survivorship bias), costs estimated. Past results do not guarantee future ones.
+
+Signals only. Not investment advice.

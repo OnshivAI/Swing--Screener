@@ -1,2 +1,5 @@
 ticker,fetched_at,src,debtToEquity,profitMargins,returnOnEquity,trailingPE,forwardPE,sector
 KOTAKBANK.NS,2026-10-03,ratios+calculated,52.6379214105904,0.28467,0.1064301272451493,20.487268,17.80935,Financial Services
+BHEL.NS,2026-10-06,ratios+calculated,31.312,0.06758,0.06120334529026899,64.656654,32.32063,Industrials
+MOTILALOFS.NS,2026-10-06,ratios+calculated,165.8,0.22963,0.14504143741789913,32.473442,18.130901,Financial Services
+PETRONET.NS,2026-10-06,ratios+calculated,10.507,0.113199994,0.17556928887018158,10.725923,10.422633,Energy

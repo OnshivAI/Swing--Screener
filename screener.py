@@ -74,6 +74,7 @@ CONFIG = {
 
     # Scheduling: runs before this IST hour stay silent if data is not ready (a later run retries)
     "final_attempt_hour_ist": 20,
+    "data_ready_hour_ist": 16,       # before this hour, report on the previous trading day
 }
 
 IST = timezone(timedelta(hours=5, minutes=30))
@@ -616,6 +617,17 @@ def format_report(run_date, data_date, stats, picks, record, note="",
     return "\n".join(lines)
 
 
+def expected_session(now: datetime):
+    """The trading day whose closing data we should be reporting on.
+    Before the data-ready hour (e.g. a run delayed past midnight) it is the previous weekday."""
+    d = now.date()
+    if now.hour < CONFIG["data_ready_hour_ist"]:
+        d -= timedelta(days=1)
+    while d.weekday() >= 5:            # Sat/Sun -> Friday
+        d -= timedelta(days=1)
+    return d
+
+
 # --------------------------------------------------------------------------
 # Main
 # --------------------------------------------------------------------------
@@ -627,7 +639,7 @@ def main():
     REPORTS.mkdir(exist_ok=True)
 
     now = datetime.now(IST)
-    run_date = now.date()
+    run_date = expected_session(now)   # the session being reported (not the clock date)
     # Scheduled runs fire up to 3 times a day; only the first successful one reports.
     scheduled = os.getenv("GITHUB_EVENT_NAME") == "schedule"
     if not force and MARKER.exists() and MARKER.read_text().strip() == run_date.isoformat():
@@ -639,7 +651,7 @@ def main():
     open_tickers = log_df.loc[log_df["status"].isin(["PENDING", "OPEN"]), "ticker"].tolist()
     prices = get_prices(sorted(set(universe) | set(open_tickers)))
     if not prices:
-        if scheduled and now.hour < CONFIG["final_attempt_hour_ist"]:
+        if scheduled and now.date() == run_date and now.hour < CONFIG["final_attempt_hour_ist"]:
             log.warning("No price data; a later scheduled run will retry.")
             return
         err = "Screener: no price data received. Check yfinance / network."
@@ -651,8 +663,9 @@ def main():
     log_df = evaluate_open(log_df, prices)
 
     picks, stats, note = [], None, ""
-    if data_date != run_date and not force:
-        if scheduled and now.hour < CONFIG["final_attempt_hour_ist"]:
+    if data_date < run_date and not force:
+        same_evening = now.date() == run_date and now.hour < CONFIG["final_attempt_hour_ist"]
+        if scheduled and same_evening:
             log_df.reindex(columns=LOG_COLUMNS).to_csv(SIGNAL_LOG, index=False)
             log.info("Today's bar not available yet; a later scheduled run will retry.")
             return
